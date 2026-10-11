@@ -25,12 +25,13 @@ export function mediaUrl(path: string): string {
   return `${MEDIA_BASE}${path.startsWith("/") ? path : `/${path}`}`;
 }
 
-// Showcase clips live on the FakeYou CDN, which serves no
-// Access-Control-Allow-Origin header. The hero wall draws them as WebGL
-// video textures, which require CORS-clean sources, so they go through the
-// same-origin /cdn-media rewrite (see next.config.ts).
+// Showcase clips load straight from the FakeYou CDN (Cloudflare), never
+// through Netlify, which bills every proxied byte. The hero wall draws them
+// as WebGL video textures, which require CORS-clean sources, so the CDN must
+// send Access-Control-Allow-Origin for /videos/* (a Cloudflare response
+// header rule).
 export function cdnMediaUrl(path: string): string {
-  return `/cdn-media${path.startsWith("/") ? path : `/${path}`}`;
+  return `https://frontend-cdn.fakeyou.com${path.startsWith("/") ? path : `/${path}`}`;
 }
 
 export const SOCIAL_LINKS = {
