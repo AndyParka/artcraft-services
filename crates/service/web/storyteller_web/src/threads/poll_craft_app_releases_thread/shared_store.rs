@@ -5,18 +5,25 @@
 //! before writing, so a slow instance never replaces a newer fetch with an older one. A `304`
 //! moves only `fetched_ms`, and only if the stored ETag is still the one that was revalidated.
 //!
+//! Some Redis setups refuse scripts (scripting disabled, an ACL without `EVAL`, a proxy). The
+//! first time Redis refuses the script, this store switches to applying the same rule itself:
+//! it `WATCH`es the hash, reads and decodes the guarding fields, decides, and writes in a
+//! `MULTI`/`EXEC` that Redis drops if another instance wrote in between (then it decides again).
+//!
 //! The pool is r2d2 (blocking), so every call runs on tokio's blocking pool with a timeout:
 //! Redis trouble costs the polling loop a few seconds at most, never a stuck thread of the
 //! async runtime.
 
 use std::collections::HashMap;
-use std::sync::LazyLock;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
+use log::warn;
 use r2d2::Pool;
-use redis::{Client, Connection, RedisResult, Script};
+use redis::{Client, Connection, ErrorKind, RedisError, RedisResult, Script, ServerErrorKind, Value};
 
 use artcraft_api_defs::craft_apps::release_info::CraftAppRelease;
 use redis_schema::keys::craft_apps::craft_app_release_redis_key::CraftAppReleaseRedisKey;
@@ -33,6 +40,9 @@ const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a claim on an app keeps other instances from requesting it too: longer than one
 /// request can take (10 s to connect, 30 s for the answer), plus a margin.
 pub const CLAIM_WINDOW: Duration = Duration::from_secs(60);
+/// Without scripts: how many times a guarded write decides again after another instance wrote
+/// between its read and its write, before giving up (as if it lost the race).
+const WATCH_ATTEMPTS: usize = 3;
 
 /// Writes `ARGV[6..]` (field/value pairs) to the hash `KEYS[1]` and sets its TTL to `ARGV[4]` ms,
 /// unless the hash's time field `ARGV[1]` already holds a value greater than
@@ -60,6 +70,8 @@ pub struct SharedStore {
   pool: Pool<Client>,
   /// Written as `by`, for debugging.
   hostname: String,
+  /// Set once Redis refuses the guarded-write script; from then on guarded writes use `WATCH`.
+  scripts_refused: Arc<AtomicBool>,
 }
 
 /// A guarded write: which time field guards it, and what to write.
@@ -74,7 +86,7 @@ struct GuardedWrite {
 
 impl SharedStore {
   pub fn new(pool: Pool<Client>, hostname: String) -> Self {
-    Self { pool, hostname }
+    Self { pool, hostname, scripts_refused: Arc::new(AtomicBool::new(false)) }
   }
 
   /// The shared entries of `app_keys` (in order; `None` for absent or unreadable ones) and the
@@ -172,24 +184,25 @@ impl SharedStore {
         .await
   }
 
+  /// Applies `write` with the script, or (once Redis has refused the script) with `WATCH`.
   async fn guarded_write(&self, write: GuardedWrite) -> anyhow::Result<bool> {
     let ttl_ms = CraftAppReleaseRedisKey::get_redis_ttl().num_milliseconds();
-    let written: i64 = self
+    let scripts_refused = self.scripts_refused.clone();
+    self
         .run(move |conn| {
-          let mut invocation = GUARDED_HSET.key(&write.key);
-          invocation
-              .arg(write.time_field)
-              .arg(write.time.timestamp_millis())
-              .arg(write.min_gap.as_millis() as u64)
-              .arg(ttl_ms)
-              .arg(write.required_etag.as_deref().unwrap_or_default());
-          for (field, value) in &write.fields {
-            invocation.arg(*field).arg(value);
+          if !scripts_refused.load(Ordering::Relaxed) {
+            match guarded_write_with_script(conn, &write, ttl_ms) {
+              Err(err) if is_script_refusal(&err) => {
+                if !scripts_refused.swap(true, Ordering::Relaxed) {
+                  warn!("Craft app releases: Redis refused the guarded-write script ({err}); writing with WATCH/MULTI/EXEC instead.");
+                }
+              }
+              result => return result,
+            }
           }
-          invocation.invoke(conn)
+          guarded_write_with_watch(conn, &write, ttl_ms)
         })
-        .await?;
-    Ok(written == 1)
+        .await
   }
 
   /// Runs `call` on a pooled connection, off the async runtime, within [`CALL_TIMEOUT`].
@@ -211,27 +224,247 @@ impl SharedStore {
   }
 }
 
+/// [`GUARDED_HSET_LUA`] decides and writes on the server, in one step.
+fn guarded_write_with_script(conn: &mut Connection, write: &GuardedWrite, ttl_ms: i64) -> RedisResult<bool> {
+  let mut invocation = GUARDED_HSET.key(&write.key);
+  invocation
+      .arg(write.time_field)
+      .arg(write.time.timestamp_millis())
+      .arg(write.min_gap.as_millis() as u64)
+      .arg(ttl_ms)
+      .arg(write.required_etag.as_deref().unwrap_or_default());
+  for (field, value) in &write.fields {
+    invocation.arg(*field).arg(value);
+  }
+  let written: i64 = invocation.invoke(conn)?;
+  Ok(written == 1)
+}
+
+/// The same rule without scripts: `WATCH` the hash, read and decode its guarding fields, decide
+/// with [`write_wins`], then write in a transaction. If another instance wrote the hash in
+/// between, Redis drops the transaction and this decides again with what it wrote.
+fn guarded_write_with_watch(conn: &mut Connection, write: &GuardedWrite, ttl_ms: i64) -> RedisResult<bool> {
+  for _ in 0..WATCH_ATTEMPTS {
+    redis::cmd("WATCH").arg(&write.key).query::<()>(conn)?;
+    let stored: RedisResult<(Option<String>, Option<String>)> = redis::cmd("HMGET")
+        .arg(&write.key)
+        .arg(write.time_field)
+        .arg(shared_entry::FIELD_ETAG)
+        .query(conn);
+    let (stored_time, stored_etag) = match stored {
+      Ok(stored) => stored,
+      Err(err) => {
+        // The connection goes back to the shared pool; don't leave it watching.
+        let _ = redis::cmd("UNWATCH").query::<()>(conn);
+        return Err(err);
+      }
+    };
+    if !write_wins(write, stored_time.as_deref(), stored_etag.as_deref()) {
+      redis::cmd("UNWATCH").query::<()>(conn)?;
+      return Ok(false);
+    }
+    // `EXEC` ends the watch either way; `None` means another write got in first.
+    let committed: Option<Value> = redis::pipe()
+        .atomic()
+        .hset_multiple(&write.key, &write.fields)
+        .pexpire(&write.key, ttl_ms)
+        .query(conn)?;
+    if committed.is_some() {
+      return Ok(true);
+    }
+  }
+  Ok(false)
+}
+
+/// Whether `write` may replace what the hash holds, by the script's rule: not if the stored time
+/// plus the minimum gap is later than the new time, nor if an ETag is required and the stored
+/// one differs. An unreadable stored time doesn't block the write, so garbage gets overwritten.
+fn write_wins(write: &GuardedWrite, stored_time: Option<&str>, stored_etag: Option<&str>) -> bool {
+  let new_ms = write.time.timestamp_millis();
+  let gap_ms = write.min_gap.as_millis().min(i64::MAX as u128) as i64;
+  if let Some(current_ms) = stored_time.and_then(|t| t.parse::<i64>().ok()) {
+    if current_ms.saturating_add(gap_ms) > new_ms {
+      return false;
+    }
+  }
+  match write.required_etag.as_deref().filter(|etag| !etag.is_empty()) {
+    Some(required) => stored_etag == Some(required),
+    None => true,
+  }
+}
+
+/// Whether Redis answered that it won't run the script (as opposed to being unreachable, busy,
+/// out of memory or read-only, which the `WATCH` path wouldn't get past either): an ACL
+/// refusal, an unknown `EVALSHA`/`EVAL`/`SCRIPT` command, or scripting switched off.
+fn is_script_refusal(err: &RedisError) -> bool {
+  if err.is_io_error() || err.is_timeout() || err.is_connection_dropped() || err.is_connection_refusal() {
+    return false;
+  }
+  match err.kind() {
+    ErrorKind::Server(ServerErrorKind::NoPerm) => true,
+    ErrorKind::Server(ServerErrorKind::ResponseError) | ErrorKind::Extension => {
+      if err.code() == Some("BUSY") {
+        return false;
+      }
+      let detail = err.detail().unwrap_or_default().to_ascii_lowercase();
+      detail.contains("unknown command") || detail.contains("eval") || detail.contains("script")
+    }
+    _ => false,
+  }
+}
+
+
 #[cfg(test)]
 mod tests {
   use chrono::TimeZone;
+  use url::Url;
 
   use super::*;
 
-  /// Against a real Redis (`CRAFT_APPS_TEST_REDIS_URL`, default `redis://127.0.0.1:6379/`). Uses
-  /// app keys of its own, deletes them afterwards, and leaves the fleet backoff key alone unless
-  /// it was absent.
+  const DEFAULT_TEST_REDIS_URL: &str = "redis://127.0.0.1:6379/";
+
+  /// Against a real Redis (`CRAFT_APPS_TEST_REDIS_URL`, default `redis://127.0.0.1:6379/`). Each
+  /// test uses app keys of its own, deletes them afterwards, and leaves the fleet backoff key
+  /// alone unless it was absent.
   /// `cargo test -p storyteller-web --bin storyteller-web shared_store -- --ignored`
+  mod live_redis_tests {
+    use super::*;
+
+    #[tokio::test]
+    #[ignore = "needs a Redis server"]
+    async fn guarded_writes_with_the_script() {
+      let pool = test_pool(&test_redis_url());
+      let (pod_a, pod_b) = (SharedStore::new(pool.clone(), "pod-a".into()), SharedStore::new(pool, "pod-b".into()));
+      exercise_guarded_writes(&pod_a, &pod_b).await;
+      assert!(!pod_a.scripts_refused.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    #[ignore = "needs a Redis server"]
+    async fn guarded_writes_with_watch() {
+      let pool = test_pool(&test_redis_url());
+      let (pod_a, pod_b) = (SharedStore::new(pool.clone(), "pod-a".into()), SharedStore::new(pool, "pod-b".into()));
+      pod_a.scripts_refused.store(true, Ordering::Relaxed);
+      pod_b.scripts_refused.store(true, Ordering::Relaxed);
+      exercise_guarded_writes(&pod_a, &pod_b).await;
+    }
+
+    /// A Redis user without scripting permissions: the first guarded write is refused, and the
+    /// store switches to `WATCH` and still applies every rule.
+    #[tokio::test]
+    #[ignore = "needs a Redis server that supports ACLs"]
+    async fn a_refused_script_falls_back_to_watch() {
+      let admin_url = test_redis_url();
+      let admin = test_pool(&admin_url);
+      let user = format!("craft-test-{}", rand::random::<u32>());
+      let password = format!("pw-{}", rand::random::<u64>());
+      let mut conn = admin.get().unwrap();
+      redis::cmd("ACL").arg("SETUSER").arg(&user).arg("reset").arg("on").arg(format!(">{password}")).arg("~*").arg("&*").arg("+@all").arg("-@scripting")
+          .query::<()>(&mut *conn).unwrap();
+
+      let mut url = Url::parse(&admin_url).unwrap();
+      url.set_username(&user).unwrap();
+      url.set_password(Some(&password)).unwrap();
+      let pool = test_pool(url.as_str());
+      let (pod_a, pod_b) = (SharedStore::new(pool.clone(), "pod-a".into()), SharedStore::new(pool, "pod-b".into()));
+      exercise_guarded_writes(&pod_a, &pod_b).await;
+
+      redis::cmd("ACL").arg("DELUSER").arg(&user).query::<()>(&mut *conn).unwrap();
+      assert!(pod_a.scripts_refused.load(Ordering::Relaxed), "the script should have been refused");
+      assert!(pod_b.scripts_refused.load(Ordering::Relaxed), "the script should have been refused");
+    }
+  }
+
+  /// An unreachable Redis fails fast, so the loop can fall back to polling on its own.
   #[tokio::test]
-  #[ignore = "needs a Redis server"]
-  async fn guarded_writes_against_a_real_redis() {
-    let url = std::env::var("CRAFT_APPS_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let pool = Pool::builder().max_size(2).build(Client::open(url).unwrap()).unwrap();
-    let pod_a = SharedStore::new(pool.clone(), "pod-a".into());
-    let pod_b = SharedStore::new(pool.clone(), "pod-b".into());
+  async fn an_unreachable_redis_fails_fast() {
+    let pool = Pool::builder().max_size(1).build_unchecked(Client::open("redis://127.0.0.1:1/").unwrap());
+    let store = SharedStore::new(pool, "pod".into());
+    let started = std::time::Instant::now();
+    assert!(store.read(&["photocraft".to_string()]).await.is_err());
+    assert!(started.elapsed() < CALL_TIMEOUT + Duration::from_secs(1));
+  }
+
+  /// [`write_wins`] must decide exactly as [`GUARDED_HSET_LUA`] does.
+  mod write_rule_tests {
+    use super::*;
+
+    #[test]
+    fn a_write_never_goes_back_in_time() {
+      let write = guarded_write_at(t(2), Duration::ZERO, None);
+      assert!(write_wins(&write, None, None), "nothing stored");
+      assert!(write_wins(&write, Some(&ms(t(1))), None), "newer than stored");
+      assert!(write_wins(&write, Some(&ms(t(2))), None), "same time, as the script allows");
+      assert!(!write_wins(&write, Some(&ms(t(3))), None), "older than stored");
+    }
+
+    #[test]
+    fn a_claim_waits_for_the_window() {
+      let claim = guarded_write_at(t(1), CLAIM_WINDOW, None);
+      assert!(!write_wins(&claim, Some(&ms(t(0) + chrono::Duration::seconds(30))), None));
+      assert!(write_wins(&claim, Some(&ms(t(0))), None), "exactly one window later");
+    }
+
+    #[test]
+    fn a_required_etag_must_match() {
+      let write = guarded_write_at(t(2), Duration::ZERO, Some("\"e2\""));
+      assert!(write_wins(&write, Some(&ms(t(1))), Some("\"e2\"")));
+      assert!(!write_wins(&write, Some(&ms(t(1))), Some("\"e1\"")), "another release is shared");
+      assert!(!write_wins(&write, Some(&ms(t(1))), None), "no release is shared");
+      assert!(write_wins(&guarded_write_at(t(2), Duration::ZERO, Some("")), None, None), "empty means none required");
+    }
+
+    #[test]
+    fn an_unreadable_stored_time_is_overwritten() {
+      let write = guarded_write_at(t(2), Duration::ZERO, None);
+      assert!(write_wins(&write, Some("soon"), None));
+      assert!(write_wins(&write, Some(""), None));
+    }
+  }
+
+  mod script_refusal_tests {
+    use redis::make_extension_error;
+
+    use super::*;
+
+    #[test]
+    fn redis_refusing_scripts_is_a_refusal() {
+      let refusals = [
+        server_error(ServerErrorKind::NoPerm, "this user has no permissions to run the 'evalsha' command"),
+        server_error(ServerErrorKind::ResponseError, "unknown command 'EVALSHA', with args beginning with: "),
+        server_error(ServerErrorKind::ResponseError, "This Redis instance has scripting disabled"),
+        make_extension_error("ERR".to_string(), Some("unknown command 'SCRIPT'".to_string())),
+      ];
+      for err in refusals {
+        assert!(is_script_refusal(&err), "{:?}", err);
+      }
+    }
+
+    #[test]
+    fn redis_being_unavailable_is_not_a_refusal() {
+      let unavailable = [
+        RedisError::from(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "refused")),
+        RedisError::from(std::io::Error::new(std::io::ErrorKind::TimedOut, "timed out")),
+        make_extension_error("OOM".to_string(), Some("command not allowed when used memory > 'maxmemory'.".to_string())),
+        make_extension_error("BUSY".to_string(), Some("Redis is busy running a script.".to_string())),
+        server_error(ServerErrorKind::ReadOnly, "You can't write against a read only replica."),
+        server_error(ServerErrorKind::ResponseError, "wrong number of arguments for 'hset' command"),
+      ];
+      for err in unavailable {
+        assert!(!is_script_refusal(&err), "{:?}", err);
+      }
+    }
+
+    fn server_error(kind: ServerErrorKind, detail: &str) -> RedisError {
+      RedisError::from((ErrorKind::Server(kind), "server error", detail.to_string()))
+    }
+  }
+
+  /// Every guarded-write rule, as two instances sharing one Redis see it.
+  async fn exercise_guarded_writes(pod_a: &SharedStore, pod_b: &SharedStore) {
     let app = format!("test-craft-{}", rand::random::<u32>());
     let other = format!("{app}-other");
     let keys = vec![app.clone(), other.clone()];
-    let t = |m: u32| Utc.with_ymd_and_hms(2026, 10, 10, 12, m, 0).unwrap();
     let read_app = |store: SharedStore, keys: Vec<String>| async move { store.read(&keys).await.unwrap().0.remove(0) };
 
     // Nothing yet.
@@ -289,13 +522,30 @@ mod tests {
     pod_a.run(move |conn| redis::cmd("DEL").arg(&cleanup).query::<()>(conn)).await.unwrap();
   }
 
-  /// An unreachable Redis fails fast, so the loop can fall back to polling on its own.
-  #[tokio::test]
-  async fn an_unreachable_redis_fails_fast() {
-    let pool = Pool::builder().max_size(1).build_unchecked(Client::open("redis://127.0.0.1:1/").unwrap());
-    let store = SharedStore::new(pool, "pod".into());
-    let started = std::time::Instant::now();
-    assert!(store.read(&["photocraft".to_string()]).await.is_err());
-    assert!(started.elapsed() < CALL_TIMEOUT + Duration::from_secs(1));
+  fn guarded_write_at(time: DateTime<Utc>, min_gap: Duration, required_etag: Option<&str>) -> GuardedWrite {
+    GuardedWrite {
+      key: "craftApps:releases:app:test".to_string(),
+      time_field: shared_entry::FIELD_FETCHED_MS,
+      time,
+      min_gap,
+      required_etag: required_etag.map(str::to_string),
+      fields: Vec::new(),
+    }
+  }
+
+  fn test_redis_url() -> String {
+    std::env::var("CRAFT_APPS_TEST_REDIS_URL").unwrap_or_else(|_| DEFAULT_TEST_REDIS_URL.to_string())
+  }
+
+  fn test_pool(url: &str) -> Pool<Client> {
+    Pool::builder().max_size(2).build(Client::open(url).unwrap()).unwrap()
+  }
+
+  fn t(minute: u32) -> DateTime<Utc> {
+    Utc.with_ymd_and_hms(2026, 10, 10, 12, minute, 0).unwrap()
+  }
+
+  fn ms(time: DateTime<Utc>) -> String {
+    time.timestamp_millis().to_string()
   }
 }
