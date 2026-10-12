@@ -2,8 +2,10 @@
 //! `GET /v1/craft_apps/release_info` serves to ArtCraft Launcher (so thousands of launchers don't
 //! each poll GitHub).
 //!
-//! Every instance runs this loop, waking every [`TICK`] (30 s, with jitter). With coordination
-//! (the default) the fleet shares its work through Redis (`shared_entry` documents the keys):
+//! Every instance runs this loop, waking every [`TICK`] (30 s, with jitter). At startup it first
+//! takes the fleet's shared releases from Redis, so a new instance serves them at once without
+//! asking GitHub. With coordination (the default) the fleet shares its work through Redis
+//! (`shared_entry` documents the keys):
 //!
 //! 1. Read every app's shared entry and the fleet's backoff; take anything newer into memory.
 //!    The endpoint always serves memory, so it keeps answering whatever Redis does.
@@ -61,6 +63,11 @@ pub async fn poll_craft_app_releases(cache: CraftAppsReleaseCache, config: Craft
   );
   let store = config.coordination_enabled.then(|| SharedStore::new(redis_pool, hostname));
   let mut poller = Poller::new(client, cache, config, store);
+  // Warm memory from the fleet's shared copy right away: it costs no GitHub quota, and the
+  // jitter below only needs to spread out requests to GitHub.
+  if poller.refresh_from_shared().await {
+    info!("Craft app releases: took the fleet's shared releases from Redis at startup.");
+  }
   tokio::time::sleep(jittered(STARTUP_JITTER, 1.0)).await;
   loop {
     poller.tick().await;
@@ -355,6 +362,39 @@ mod tests {
       assert_eq!(cache.etag(key).as_deref(), Some("\"e\""));
     }
 
+    let keys: Vec<String> = config.apps.iter().map(|(k, _, _)| CraftAppReleaseRedisKey::new_for_app(k).to_string()).collect();
+    let mut conn = pool.get().unwrap();
+    redis::cmd("DEL").arg(&keys).query::<()>(&mut *conn).unwrap();
+  }
+
+  /// Against a real Redis, as above: a new instance serves the fleet's releases right after
+  /// startup, before its startup jitter ends, without asking GitHub.
+  /// `cargo test -p storyteller-web --bin storyteller-web warm -- --ignored`
+  #[tokio::test]
+  #[ignore = "needs a Redis server"]
+  async fn a_new_instance_is_warm_from_redis_at_startup() {
+    let url = std::env::var("CRAFT_APPS_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
+    let pool = Pool::builder().max_size(2).build(Client::open(url).unwrap()).unwrap();
+    let mut config = config();
+    let prefix = format!("test-craft-{}", rand::random::<u32>());
+    config.apps = vec![(format!("{prefix}-a"), "A".into(), "storytold/a".into()), (format!("{prefix}-b"), "B".into(), "storytold/b".into())];
+    let fetched_by_another_pod = Utc::now();
+    let other_pod = SharedStore::new(pool.clone(), "other-pod".into());
+    for (key, _, _) in &config.apps {
+      assert!(other_pod.write_fetched(key, None, Some("\"e\""), fetched_by_another_pod).await.unwrap());
+    }
+
+    let cache = CraftAppsReleaseCache::new();
+    let poller = tokio::spawn(poll_craft_app_releases(cache.clone(), config.clone(), pool.clone(), "new-pod".into()));
+    let deadline = Instant::now() + Duration::from_secs(2);
+    while config.apps.iter().any(|(key, _, _)| fetched_at(&cache, key).is_none()) && Instant::now() < deadline {
+      tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    poller.abort();
+
+    for (key, _, _) in &config.apps {
+      assert_eq!(fetched_at(&cache, key).map(|t| t.timestamp_millis()), Some(fetched_by_another_pod.timestamp_millis()), "{}", key);
+    }
     let keys: Vec<String> = config.apps.iter().map(|(k, _, _)| CraftAppReleaseRedisKey::new_for_app(k).to_string()).collect();
     let mut conn = pool.get().unwrap();
     redis::cmd("DEL").arg(&keys).query::<()>(&mut *conn).unwrap();
