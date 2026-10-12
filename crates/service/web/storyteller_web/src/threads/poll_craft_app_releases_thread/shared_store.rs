@@ -12,7 +12,9 @@
 //!
 //! The pool is r2d2 (blocking), so every call runs on tokio's blocking pool with a timeout:
 //! Redis trouble costs the polling loop a few seconds at most, never a stuck thread of the
-//! async runtime.
+//! async runtime. The poller gets its own small pool ([`build_poller_redis_pool`]) whose
+//! connections time out reads and writes, so a hung Redis can neither strand blocking threads
+//! nor take connections from the request handlers' pool.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -22,8 +24,8 @@ use std::time::Duration;
 use anyhow::anyhow;
 use chrono::{DateTime, Utc};
 use log::warn;
-use r2d2::Pool;
-use redis::{Client, Connection, ErrorKind, RedisError, RedisResult, Script, ServerErrorKind, Value};
+use r2d2::{ManageConnection, Pool};
+use redis::{Client, Connection, ConnectionLike, ErrorKind, RedisError, RedisResult, Script, ServerErrorKind, Value};
 
 use artcraft_api_defs::craft_apps::release_info::CraftAppRelease;
 use redis_schema::keys::craft_apps::craft_app_release_redis_key::CraftAppReleaseRedisKey;
@@ -33,8 +35,13 @@ use crate::threads::poll_craft_app_releases_thread::scheduling::Backoff;
 use crate::threads::poll_craft_app_releases_thread::shared_entry;
 use crate::threads::poll_craft_app_releases_thread::shared_entry::{SharedAppEntry, SharedFailure};
 
+/// Connections in the poller's pool: one per instance is all the loop uses at a time.
+const POOL_MAX_SIZE: u32 = 2;
 /// Longest wait for a pooled connection.
 const CONNECTION_TIMEOUT: Duration = Duration::from_secs(3);
+/// Longest wait for one read or write on a connection; after it, the connection gives up
+/// instead of holding its blocking thread until the operating system notices a dead peer.
+const IO_TIMEOUT: Duration = Duration::from_secs(5);
 /// Longest wait for a whole call, connection included.
 const CALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long a claim on an app keeps other instances from requesting it too: longer than one
@@ -67,11 +74,19 @@ static GUARDED_HSET: LazyLock<Script> = LazyLock::new(|| Script::new(GUARDED_HSE
 /// Handle on the shared state. Cheap to clone.
 #[derive(Clone)]
 pub struct SharedStore {
-  pool: Pool<Client>,
+  pool: PollerRedisPool,
   /// Written as `by`, for debugging.
   hostname: String,
   /// Set once Redis refuses the guarded-write script; from then on guarded writes use `WATCH`.
   scripts_refused: Arc<AtomicBool>,
+}
+
+/// The poller's Redis pool; see [`build_poller_redis_pool`].
+pub type PollerRedisPool = Pool<PollerRedisConnections>;
+
+/// Makes the poller's Redis connections, every one of them with I/O timeouts.
+pub struct PollerRedisConnections {
+  client: Client,
 }
 
 /// A guarded write: which time field guards it, and what to write.
@@ -85,7 +100,7 @@ struct GuardedWrite {
 }
 
 impl SharedStore {
-  pub fn new(pool: Pool<Client>, hostname: String) -> Self {
+  pub fn new(pool: PollerRedisPool, hostname: String) -> Self {
     Self { pool, hostname, scripts_refused: Arc::new(AtomicBool::new(false)) }
   }
 
@@ -224,6 +239,41 @@ impl SharedStore {
   }
 }
 
+/// The poller's own Redis pool, apart from the one the request handlers use. Built without
+/// connecting, so an unreachable Redis at startup doesn't stop the server: the poller then
+/// works alone until Redis answers.
+pub fn build_poller_redis_pool(redis_url: &str) -> RedisResult<PollerRedisPool> {
+  let manager = PollerRedisConnections { client: Client::open(redis_url)? };
+  Ok(Pool::builder()
+      .max_size(POOL_MAX_SIZE)
+      .min_idle(Some(0))
+      .connection_timeout(CONNECTION_TIMEOUT)
+      .build_unchecked(manager))
+}
+
+impl ManageConnection for PollerRedisConnections {
+  type Connection = Connection;
+  type Error = RedisError;
+
+  /// Connects (handshake included) within [`CONNECTION_TIMEOUT`], then makes every later read
+  /// and write give up after [`IO_TIMEOUT`], before the connection is ever used.
+  fn connect(&self) -> RedisResult<Connection> {
+    let conn = self.client.get_connection_with_timeout(CONNECTION_TIMEOUT)?;
+    conn.set_read_timeout(Some(IO_TIMEOUT))?;
+    conn.set_write_timeout(Some(IO_TIMEOUT))?;
+    Ok(conn)
+  }
+
+  /// The pool's check before lending a connection; bounded by [`IO_TIMEOUT`] like any command.
+  fn is_valid(&self, conn: &mut Connection) -> RedisResult<()> {
+    redis::cmd("PING").query::<()>(conn)
+  }
+
+  fn has_broken(&self, conn: &mut Connection) -> bool {
+    !conn.is_open()
+  }
+}
+
 /// [`GUARDED_HSET_LUA`] decides and writes on the server, in one step.
 fn guarded_write_with_script(conn: &mut Connection, write: &GuardedWrite, ttl_ms: i64) -> RedisResult<bool> {
   let mut invocation = GUARDED_HSET.key(&write.key);
@@ -316,6 +366,9 @@ fn is_script_refusal(err: &RedisError) -> bool {
 
 #[cfg(test)]
 mod tests {
+  use std::io::{Read, Write};
+  use std::net::{TcpListener, TcpStream};
+
   use chrono::TimeZone;
   use url::Url;
 
@@ -378,11 +431,30 @@ mod tests {
   /// An unreachable Redis fails fast, so the loop can fall back to polling on its own.
   #[tokio::test]
   async fn an_unreachable_redis_fails_fast() {
-    let pool = Pool::builder().max_size(1).build_unchecked(Client::open("redis://127.0.0.1:1/").unwrap());
+    let pool = build_poller_redis_pool("redis://127.0.0.1:1/").unwrap();
     let store = SharedStore::new(pool, "pod".into());
     let started = std::time::Instant::now();
     assert!(store.read(&["photocraft".to_string()]).await.is_err());
     assert!(started.elapsed() < CALL_TIMEOUT + Duration::from_secs(1));
+  }
+
+  /// A Redis that completes the connection handshake and then stops answering (a wedged server,
+  /// a half-open connection): the call fails by itself, before [`CALL_TIMEOUT`] gives up on it,
+  /// so its blocking thread and connection are released rather than stranded until the
+  /// operating system notices. Without I/O timeouts the pool's `PING` would hang here forever.
+  #[tokio::test]
+  async fn a_redis_that_stops_answering_releases_the_blocking_thread() {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let url = format!("redis://{}/", listener.local_addr().unwrap());
+    std::thread::spawn(move || {
+      for stream in listener.incoming().flatten() {
+        std::thread::spawn(move || answer_handshake_then_go_silent(stream));
+      }
+    });
+    let store = SharedStore::new(build_poller_redis_pool(&url).unwrap(), "pod".into());
+    let started = std::time::Instant::now();
+    let err = store.read(&["photocraft".to_string()]).await.unwrap_err();
+    assert!(started.elapsed() < CALL_TIMEOUT, "{:?} after {:?}", err, started.elapsed());
   }
 
   /// [`write_wins`] must decide exactly as [`GUARDED_HSET_LUA`] does.
@@ -533,12 +605,33 @@ mod tests {
     }
   }
 
+  /// Answers `+OK` to connection setup (`CLIENT SETINFO`, `SELECT`, `HELLO`), then keeps the
+  /// connection open without another word once a real command (`PING`, `HGETALL`, ...) arrives.
+  fn answer_handshake_then_go_silent(mut stream: TcpStream) {
+    let mut buf = [0u8; 4096];
+    loop {
+      let n = match stream.read(&mut buf) {
+        Ok(0) | Err(_) => return,
+        Ok(n) => n,
+      };
+      let chunk = String::from_utf8_lossy(&buf[..n]).to_ascii_uppercase();
+      if !(chunk.contains("CLIENT") || chunk.contains("SELECT") || chunk.contains("HELLO")) {
+        std::thread::sleep(Duration::from_secs(60));
+        return;
+      }
+      let commands = chunk.lines().filter(|line| line.starts_with('*')).count();
+      if stream.write_all("+OK\r\n".repeat(commands).as_bytes()).is_err() {
+        return;
+      }
+    }
+  }
+
   fn test_redis_url() -> String {
     std::env::var("CRAFT_APPS_TEST_REDIS_URL").unwrap_or_else(|_| DEFAULT_TEST_REDIS_URL.to_string())
   }
 
-  fn test_pool(url: &str) -> Pool<Client> {
-    Pool::builder().max_size(2).build(Client::open(url).unwrap()).unwrap()
+  fn test_pool(url: &str) -> PollerRedisPool {
+    build_poller_redis_pool(url).unwrap()
   }
 
   fn t(minute: u32) -> DateTime<Utc> {

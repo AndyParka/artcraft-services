@@ -27,8 +27,6 @@ use std::time::{Duration, Instant};
 
 use chrono::Utc;
 use log::{error, info, warn};
-use r2d2::Pool;
-use redis::Client;
 
 use crate::state::craft_apps_release_cache::CraftAppsReleaseCache;
 use crate::threads::poll_craft_app_releases_thread::config::CraftAppsPollConfig;
@@ -37,14 +35,14 @@ use crate::threads::poll_craft_app_releases_thread::github;
 use crate::threads::poll_craft_app_releases_thread::github::FetchOutcome;
 use crate::threads::poll_craft_app_releases_thread::scheduling::{backoff_after, is_due, jittered, Backoff, RoundResult, TICK};
 use crate::threads::poll_craft_app_releases_thread::shared_entry::{SharedAppEntry, SharedFailure};
-use crate::threads::poll_craft_app_releases_thread::shared_store::SharedStore;
+use crate::threads::poll_craft_app_releases_thread::shared_store::{PollerRedisPool, SharedStore};
 
 /// Spreads a fleet's first tick over this window, so a deploy doesn't hit GitHub all at once.
 const STARTUP_JITTER: Duration = Duration::from_secs(15);
 /// Pause between the requests of one round.
 const BETWEEN_REQUESTS: Duration = Duration::from_millis(1_000);
 
-pub async fn poll_craft_app_releases(cache: CraftAppsReleaseCache, config: CraftAppsPollConfig, redis_pool: Pool<Client>, hostname: String) {
+pub async fn poll_craft_app_releases(cache: CraftAppsReleaseCache, config: CraftAppsPollConfig, redis_pool: PollerRedisPool, hostname: String) {
   cache.register_apps(&config.apps);
   if !config.enabled {
     info!("Craft app release polling is disabled (CRAFT_APPS_RELEASE_POLLING_ENABLED=false).");
@@ -294,6 +292,7 @@ mod tests {
 
   use crate::threads::poll_craft_app_releases_thread::config::default_apps;
   use crate::threads::poll_craft_app_releases_thread::shared_entry::{decode_app_entry, encode_fetch};
+  use crate::threads::poll_craft_app_releases_thread::shared_store::build_poller_redis_pool;
 
   use super::*;
 
@@ -341,7 +340,7 @@ mod tests {
   #[ignore = "needs a Redis server"]
   async fn takes_fresh_releases_from_redis_instead_of_github() {
     let url = std::env::var("CRAFT_APPS_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let pool = Pool::builder().max_size(2).build(Client::open(url).unwrap()).unwrap();
+    let pool = build_poller_redis_pool(&url).unwrap();
     let mut config = config();
     let prefix = format!("test-craft-{}", rand::random::<u32>());
     config.apps = vec![(format!("{prefix}-a"), "A".into(), "storytold/a".into()), (format!("{prefix}-b"), "B".into(), "storytold/b".into())];
@@ -374,7 +373,7 @@ mod tests {
   #[ignore = "needs a Redis server"]
   async fn a_new_instance_is_warm_from_redis_at_startup() {
     let url = std::env::var("CRAFT_APPS_TEST_REDIS_URL").unwrap_or_else(|_| "redis://127.0.0.1:6379/".to_string());
-    let pool = Pool::builder().max_size(2).build(Client::open(url).unwrap()).unwrap();
+    let pool = build_poller_redis_pool(&url).unwrap();
     let mut config = config();
     let prefix = format!("test-craft-{}", rand::random::<u32>());
     config.apps = vec![(format!("{prefix}-a"), "A".into(), "storytold/a".into()), (format!("{prefix}-b"), "B".into(), "storytold/b".into())];
@@ -402,7 +401,7 @@ mod tests {
 
   #[tokio::test]
   async fn an_unreachable_redis_falls_back_to_polling_alone() {
-    let pool = Pool::builder().max_size(1).build_unchecked(Client::open("redis://127.0.0.1:1/").unwrap());
+    let pool = build_poller_redis_pool("redis://127.0.0.1:1/").unwrap();
     let mut poller = fresh_poller(Some(SharedStore::new(pool, "pod".into())));
     let report = poller.tick().await;
     assert_eq!(report.mode, PollMode::Standalone);
