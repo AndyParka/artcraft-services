@@ -4,7 +4,7 @@ import {
   type CraftRelease,
   type CraftReleaseAsset,
 } from "./crafting-app-releases";
-import { mediaUrl } from "./links";
+import { cdnMediaUrl, mediaUrl } from "./links";
 
 // The Crafting Apps family: open-source native apps from the ArtCraft team,
 // each in its own storytold/<slug> repo. One entry drives the /apps hub card,
@@ -642,7 +642,7 @@ export const CRAFTING_APPS: CraftApp[] = [
       },
     ],
     demo: {
-      src: "https://frontend-cdn.fakeyou.com/videos/figcraft-collab-web.mp4",
+      src: cdnMediaUrl("/videos/figcraft-collab-web.mp4"),
       poster: "collab-poster.webp",
       label: "Live sessions",
       headline: ["Design ", "together", ", in real time."],
